@@ -2,248 +2,362 @@ import re
 import sys
 import yaml
 import argparse
-from typing import Dict, List, Any, Union, Optional
 from pathlib import Path
 
-class ConfigParser:
+class SimpleConfigParser:
     def __init__(self):
-        self.constants: Dict[str, Any] = {}
+        self.constants = {}
+
+    def _normalize_arrays(self, text):
+        import re
         
-    def remove_comments(self, text: str) -> str:
-        """Удаление многострочных комментариев"""
-        # Удаляем многострочные комментарии <# ... #>
-        pattern = r'<#.*?#>'
-        return re.sub(pattern, '', text, flags=re.DOTALL)
+        def replace_array(match):
+            content = match.group(1).strip()
+            if content and not '=' in content and not 'table(' in content:
+                return f"'({content})"
+            else:
+                return match.group(0)
+        
+        pattern = r'\(\s*((?:(?:"[^"]*"|\'[^\']*\'|[^)])+?)\s*)\)'
+        text = re.sub(pattern, replace_array, text)
+        return text
+
+    def _replace_constants_in_structure(self, data):
+        if isinstance(data, dict):
+            result = {}
+            for key, value in data.items():
+                result[key] = self._replace_constants_in_structure(value)
+            return result
+        elif isinstance(data, list):
+            return [self._replace_constants_in_structure(item) for item in data]
+        elif isinstance(data, str):
+            match = re.match(r'^\{([a-zA-Z][_a-zA-Z0-9]*)\}$', data.strip())
+            if match:
+                const_name = match.group(1)
+                if const_name in self.constants:
+                    return self.constants[const_name]
+            
+            for const_name, const_value in self.constants.items():
+                placeholder = f'{{{const_name}}}'
+                if placeholder in data:
+                    if data == placeholder:
+                        return const_value
+                    else:
+                        return data.replace(placeholder, str(const_value))
+            
+            return data
+        else:
+            return data    
     
-    def parse_value(self, value_str: str) -> Any:
-        """Парсинг значения (число, массив, словарь)"""
+    def parse(self, text):
+        text = re.sub(r'<#.*?#>', '', text, flags=re.DOTALL)
+
+        text = self._normalize_arrays(text)
+        
+        lines = text.strip().split('\n')
+        
+        non_const_lines = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            if line.startswith('var '):
+                line = line[3:].strip().rstrip(';')
+                parts = line.split(maxsplit=1)
+                if len(parts) == 2:
+                    name, value = parts
+                    
+                    if not self._is_valid_name(name):
+                        raise ValueError(f"Некорректное имя константы: {name}")
+                    
+                    parsed_value = self._parse_value_without_constants(value.strip())
+                    self.constants[name] = parsed_value
+            else:
+                non_const_lines.append(line)
+        
+        combined_text = '\n'.join(non_const_lines)
+        
+        for const_name, const_value in self.constants.items():
+            placeholder = f'{{{const_name}}}'
+            if isinstance(const_value, str):
+                replacement = f'"{const_value}"'
+            else:
+                replacement = str(const_value)
+            
+            pattern = r'\{\s*' + re.escape(const_name) + r'\s*\}'
+            combined_text = re.sub(pattern, replacement, combined_text)
+        
+        result = {}
+        i = 0
+        while i < len(non_const_lines):
+            line = non_const_lines[i].strip()
+            if not line:
+                i += 1
+                continue
+                
+            if line.replace(',', '').strip() == '':
+                i += 1
+                continue
+                
+            if '=' in line:
+                line = line.rstrip(';')
+                
+                equals_pos = line.find('=')
+                key_part = line[:equals_pos].strip()
+                value_part = line[equals_pos + 1:].strip()
+                
+                if self._is_valid_name(key_part):
+                    full_value_parts = [value_part]
+                    current_depth = 0
+                    
+                    current_depth += value_part.count('[') - value_part.count(']')
+                    current_depth += value_part.count('(') - value_part.count(')')
+                    
+                    while i + 1 < len(non_const_lines) and current_depth > 0:
+                        next_line = non_const_lines[i + 1].strip()
+                        full_value_parts.append(next_line)
+                        current_depth += next_line.count('[') - next_line.count(']')
+                        current_depth += next_line.count('(') - next_line.count(')')
+                        i += 1
+                    
+                    full_value = ' '.join(full_value_parts)
+                    
+                    full_value = full_value.rstrip(';').strip()
+                    
+                    parsed_value = self._parse_single_value(full_value)
+                    result[key_part] = parsed_value
+            
+            i += 1
+        
+        result = self._replace_constants_in_structure(result)
+        return result
+    
+    def _parse_value_without_constants(self, value_str):
         value_str = value_str.strip()
         
-        # Проверка на число
+        if not value_str:
+            return ""
+        
         if re.match(r'^-?\d+$', value_str):
             return int(value_str)
         
-        # Проверка на массив
+        if value_str.lower() in ['true', 'false']:
+            return value_str.lower() == 'true'
+        
+        if (len(value_str) >= 2 and 
+            ((value_str.startswith('"') and value_str.endswith('"')) or 
+             (value_str.startswith("'") and value_str.endswith("'")))):
+            return value_str[1:-1]
+        
         if value_str.startswith("'("):
-            return self.parse_array(value_str)
+            return self._parse_array(value_str, parse_constants=False)
         
-        # Проверка на словарь
-        if value_str.startswith('table(['):
-            return self.parse_dict(value_str)
+        if value_str.startswith('table('):
+            return self._parse_table(value_str, parse_constants=False)
         
-        # Проверка на ссылку на константу
-        if value_str.startswith('{') and value_str.endswith('}'):
-            const_name = value_str[1:-1].strip()
-            if const_name in self.constants:
-                return self.constants[const_name]
-            raise ValueError(f"Неизвестная константа: {const_name}")
-        
-        # Проверка на имя (для будущих расширений)
-        if re.match(r'^[a-zA-Z][_a-zA-Z0-9]*$', value_str):
-            return value_str
-        
-        raise ValueError(f"Некорректное значение: {value_str}")
+        return value_str
     
-    def parse_array(self, array_str: str) -> List[Any]:
-        """Парсинг массива '(... )"""
-        # Удаляем начальные и конечные символы
-        content = array_str[2:-2].strip()  # Убираем "'( " и " )"
+    def _parse_single_value(self, value_str, parse_constants=True):
+        value_str = value_str.strip()
+        
+        if not value_str:
+            return ""
+        
+        if re.match(r'^-?\d+$', value_str):
+            return int(value_str)
+        
+        if value_str.lower() in ['true', 'false']:
+            return value_str.lower() == 'true'
+        
+        if (len(value_str) >= 2 and 
+            ((value_str.startswith('"') and value_str.endswith('"')) or 
+             (value_str.startswith("'") and value_str.endswith("'")))):
+            return value_str[1:-1]
+        
+        if value_str.startswith("'("):
+            return self._parse_array(value_str, parse_constants)
+        
+        if value_str.startswith('table('):
+            return self._parse_table(value_str, parse_constants)
+        
+        return value_str
+    
+    def _parse_array(self, array_str, parse_constants=True):
+        content = array_str[2:].rstrip(')').strip()
         if not content:
             return []
         
-        # Разбиваем на значения
-        values = []
+        items = []
         current = ""
-        brace_count = 0
-        bracket_count = 0
+        depth = 0
         in_quotes = False
+        quote_char = None
         
         for char in content:
-            if char == ',' and brace_count == 0 and bracket_count == 0 and not in_quotes:
-                if current.strip():
-                    values.append(self.parse_value(current.strip()))
-                current = ""
+            if char in ['"', "'"]:
+                if not in_quotes:
+                    in_quotes = True
+                    quote_char = char
+                elif quote_char == char:
+                    in_quotes = False
+                    quote_char = None
+                current += char
+            elif not in_quotes:
+                if char == '(' or char == '[':
+                    depth += 1
+                elif char == ')' or char == ']':
+                    depth -= 1
+                elif char == ' ' and depth == 0:
+                    if current:
+                        if parse_constants:
+                            items.append(self._parse_single_value(current))
+                        else:
+                            items.append(self._parse_value_without_constants(current))
+                        current = ""
+                    continue
+                current += char
             else:
                 current += char
-                if char == '(':
-                    brace_count += 1
-                elif char == ')':
-                    brace_count -= 1
-                elif char == '[':
-                    bracket_count += 1
-                elif char == ']':
-                    bracket_count -= 1
-                elif char == "'":
-                    in_quotes = not in_quotes
         
-        if current.strip():
-            values.append(self.parse_value(current.strip()))
+        if current:
+            if parse_constants:
+                items.append(self._parse_single_value(current))
+            else:
+                items.append(self._parse_value_without_constants(current))
         
-        return values
+        return items
     
-    def parse_dict(self, dict_str: str) -> Dict[str, Any]:
-        """Парсинг словаря table([...])"""
-        # Извлекаем содержимое внутри table([...])
-        match = re.match(r'table\(\s*\[\s*(.*?)\s*\]\s*\)', dict_str, re.DOTALL)
+    def _parse_table(self, table_str, parse_constants=True):
+        match = re.search(r'table\(\s*\[\s*(.*?)\s*\]\s*\)', table_str, re.DOTALL)
         if not match:
-            raise ValueError(f"Некорректный формат словаря: {dict_str}")
+            return {}
         
         content = match.group(1).strip()
         if not content:
             return {}
         
         result = {}
-        lines = [line.strip() for line in content.split('\n') if line.strip()]
+        
+        lines = []
+        current = ''
+        depth = 0
+        in_quotes = False
+        quote_char = None
+        
+        for char in content:
+            if char in ['"', "'"]:
+                if not in_quotes:
+                    in_quotes = True
+                    quote_char = char
+                elif quote_char == char:
+                    in_quotes = False
+                    quote_char = None
+                current += char
+            elif not in_quotes:
+                if char == '[':
+                    depth += 1
+                elif char == ']':
+                    depth -= 1
+                elif char == ',' and depth == 0:
+                    lines.append(current.strip())
+                    current = ''
+                    continue
+                current += char
+            else:
+                current += char
+        
+        if current.strip():
+            lines.append(current.strip())
         
         for line in lines:
-            # Удаляем запятую в конце если есть
+            line = line.strip()
+            if not line or line == ',':
+                continue
+            
             if line.endswith(','):
                 line = line[:-1].strip()
             
-            # Разделяем имя и значение
-            if '=' not in line:
-                raise ValueError(f"Некорректная строка в словаре: {line}")
-            
-            name, value_str = line.split('=', 1)
-            name = name.strip()
-            value_str = value_str.strip()
-            
-            if not re.match(r'^[a-zA-Z][_a-zA-Z0-9]*$', name):
-                raise ValueError(f"Некорректное имя: {name}")
-            
-            result[name] = self.parse_value(value_str)
-        
-        return result
-    
-    def process_constants(self, text: str) -> str:
-        """Обработка объявлений констант var"""
-        lines = text.split('\n')
-        result_lines = []
-        i = 0
-        
-        while i < len(lines):
-            line = lines[i].strip()
-            
-            # Проверка на объявление константы
-            if line.startswith('var '):
-                # Объединение многострочных объявлений
-                const_lines = [line]
-                j = i + 1
-                while j < len(lines) and not lines[j].strip().endswith(';'):
-                    const_lines.append(lines[j].strip())
-                    j += 1
-                if j < len(lines):
-                    const_lines.append(lines[j].strip())
+            if '=' in line:
+                key = ''
+                value = ''
+                in_quotes_local = False
+                quote_char_local = None
+                equals_found = False
                 
-                const_decl = ' '.join(const_lines)
-                i = j
+                for char in line:
+                    if char in ['"', "'"]:
+                        if not in_quotes_local:
+                            in_quotes_local = True
+                            quote_char_local = char
+                        elif quote_char_local == char:
+                            in_quotes_local = False
+                            quote_char_local = None
+                        
+                        if not equals_found:
+                            key += char
+                        else:
+                            value += char
+                    elif char == '=' and not in_quotes_local:
+                        equals_found = True
+                    else:
+                        if not equals_found:
+                            key += char
+                        else:
+                            value += char
                 
-                # Парсинг объявления константы
-                match = re.match(r'var\s+([a-zA-Z][_a-zA-Z0-9]*)\s+(.*?);', const_decl, re.DOTALL)
-                if match:
-                    const_name = match.group(1)
-                    const_value_str = match.group(2).strip()
-                    self.constants[const_name] = self.parse_value(const_value_str)
+                key = key.strip()
+                value = value.strip()
+                if not self._is_valid_name(key):
+                    raise ValueError(f"Некорректное имя ключа в словаре: {key}")
+                if parse_constants:
+                    parsed_value = self._parse_single_value(value)
                 else:
-                    raise ValueError(f"Некорректное объявление константы: {const_decl}")
-            else:
-                result_lines.append(lines[i])
-            
-            i += 1
-        
-        return '\n'.join(result_lines)
-    
-    def replace_constants(self, text: str) -> str:
-        """Замена ссылок на константы {имя} их значениями"""
-        def replace_match(match):
-            const_name = match.group(1).strip()
-            if const_name in self.constants:
-                value = self.constants[const_name]
-                if isinstance(value, (int, list, dict)):
-                    return str(value)
-                return value
-            raise ValueError(f"Неизвестная константа: {const_name}")
-        
-        return re.sub(r'\{([^}]+)\}', replace_match, text)
-    
-    def parse_config(self, text: str) -> Dict[str, Any]:
-        """Основной парсинг конфигурации"""
-        # Удаляем комментарии
-        text = self.remove_comments(text)
-        
-        # Обрабатываем константы
-        text = self.process_constants(text)
-        
-        # Заменяем ссылки на константы
-        text = self.replace_constants(text)
-        
-        # Парсим оставшуюся конфигурацию
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
-        result = {}
-        
-        for line in lines:
-            # Пропускаем пустые строки и обработанные константы
-            if not line or line.startswith('var '):
-                continue
-            
-            if '=' not in line:
-                raise ValueError(f"Некорректная строка: {line}")
-            
-            name, value_str = line.split('=', 1)
-            name = name.strip()
-            value_str = value_str.strip()
-            
-            if not re.match(r'^[a-zA-Z][_a-zA-Z0-9]*$', name):
-                raise ValueError(f"Некорректное имя: {name}")
-            
-            result[name] = self.parse_value(value_str)
-        
+                    parsed_value = self._parse_value_without_constants(value)
+                result[key] = parsed_value   
         return result
     
-    def parse_file(self, input_file: str) -> Dict[str, Any]:
-        """Парсинг конфигурации из файла"""
-        with open(input_file, 'r', encoding='utf-8') as f:
+    def _is_valid_name(self, name):
+        return bool(re.match(r'^[a-zA-Z][_a-zA-Z0-9]*$', name))
+    
+    def parse_file(self, filename):
+        with open(filename, 'r', encoding='utf-8') as f:
             content = f.read()
-        return self.parse_config(content)
+        return self.parse(content)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Преобразование учебного конфигурационного языка в YAML'
-    )
-    parser.add_argument(
-        '-i', '--input',
-        required=True,
-        help='Путь к входному файлу конфигурации'
-    )
-    parser.add_argument(
-        '-o', '--output',
-        required=True,
-        help='Путь к выходному YAML файлу'
-    )
+    parser = argparse.ArgumentParser(description='Преобразование конфигурации в YAML')
+    parser.add_argument('-i', '--input', required=True, help='Входной файл')
+    parser.add_argument('-o', '--output', required=True, help='Выходной файл YAML')
     
     args = parser.parse_args()
     
-    # Проверяем существование входного файла
-    if not Path(args.input).exists():
-        print(f"Ошибка: входной файл '{args.input}' не найден", file=sys.stderr)
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    
+    if not input_path.exists():
+        print(f"Ошибка: файл {input_path} не найден", file=sys.stderr)
         sys.exit(1)
     
     try:
-        # Парсим конфигурацию
-        config_parser = ConfigParser()
-        config = config_parser.parse_file(args.input)
+        config_parser = SimpleConfigParser()
+        config = config_parser.parse_file(str(input_path))
         
-        # Сохраняем в YAML
-        with open(args.output, 'w', encoding='utf-8') as f:
-            yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
         
-        print(f"Конфигурация успешно преобразована и сохранена в '{args.output}'")
+        print(f"Конфигурация успешно преобразована и сохранена в {output_path}")
+        
+        print("\nСодержимое YAML файла:")
+        print("=" * 50)
+        print(yaml.dump(config, default_flow_style=False, allow_unicode=True, sort_keys=False))
         
     except Exception as e:
-        print(f"Ошибка при обработке конфигурации: {e}", file=sys.stderr)
+        print(f"Ошибка при обработке файла: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

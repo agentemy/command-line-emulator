@@ -1,0 +1,6 @@
+pipeline:
+  steps: '"build" "test"'
+  image: alpine
+deploy:
+  to: docker hub
+  replicas: 2

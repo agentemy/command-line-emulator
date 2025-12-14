@@ -1,0 +1,13 @@
+server_config:
+  host: 0.0.0.0
+  port: 8080
+  name: MyServer
+  ssl: true
+  endpoints:
+   -/api
+   - /admin
+   - /static 
+limits:
+  max_connections: 100
+  timeout: 30
+  rate_limit: 1000
